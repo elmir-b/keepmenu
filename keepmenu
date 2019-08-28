@@ -7,7 +7,6 @@ from contextlib import closing
 import errno
 import itertools
 import locale
-from multiprocessing import managers  # pylint: disable=unused-import
 import os
 from os.path import exists, expanduser
 import random
@@ -24,20 +23,7 @@ import webbrowser
 import construct
 from pykeyboard import PyKeyboard
 from pymouse.x11 import X11Error
-from pykeepass import PyKeePass
-if sys.version_info.major < 3:
-    # hack to reduce client connect timeout for python 2.7 (defaults to 20 seconds)
-    # https://stackoverflow.com/questions/6512884/properly-disconnect-multiprocessing-remote-manager#9936835
-    def _new_init_timeout():
-        return time.time() + 0.1
-    # pragma pylint: disable=protected-access,line-too-long
-    sys.modules['multiprocessing'].__dict__['managers'].__dict__['connection']._init_timeout = _new_init_timeout
-    # pragma pylint: enable=protected-access,line-too-long
-
-# pragma pylint: disable=ungrouped-imports,wrong-import-order,wrong-import-position
-from multiprocessing.managers import BaseManager
-from multiprocessing import Event, Process
-# pragma pylint: enable=ungrouped-imports,wrong-import-order,wrong-import-position
+from pykeepass_cache import PyKeePass
 
 try:
     import configparser
@@ -49,29 +35,7 @@ if sys.version_info.major < 3:
     str = unicode  # pylint: disable=undefined-variable, invalid-name, redefined-builtin
 
 
-AUTH_FILE = expanduser("~/.cache/.keepmenu-auth")
 CONF_FILE = expanduser("~/.config/keepmenu/config.ini")
-
-def find_free_port():
-    """Find random free port to use for BaseManager server
-
-    Returns: int Port
-
-    """
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        sock.bind(('127.0.0.1', 0))  # pylint:disable=no-member
-        return sock.getsockname()[1]  # pylint:disable=no-member
-
-
-def random_str():
-    """Generate random auth string for BaseManager
-
-    Returns: string
-
-    """
-    letters = string.ascii_lowercase
-    return ''.join(random.choice(letters) for i in range(15))
-
 
 def gen_passwd(length=20, use_digits=True, use_spec_chars=True):
     """Generate password (min 4 chars, 1 lower, 1 upper, 1 digit, 1 special char)
@@ -165,24 +129,6 @@ def process_config():
                 dmenu_err("Ydotool not installed.\n"
                           "Please install or remove that option from config.ini")
                 sys.exit()
-
-
-def get_auth():
-    """Generate and save port and authkey to ~/.cache/.keepmenu-auth
-
-    Returns: int port, bytestring authkey
-
-    """
-    auth = configparser.ConfigParser()
-    if not exists(AUTH_FILE):
-        with open(AUTH_FILE, 'w') as a_file:
-            auth.set('DEFAULT', 'port', str(find_free_port()))
-            auth.set('DEFAULT', 'authkey', random_str())
-            auth.write(a_file)
-    auth.read(AUTH_FILE)
-    port = int(auth.get('DEFAULT', 'port'))
-    authkey = auth.get('DEFAULT', 'authkey').encode()
-    return port, authkey
 
 
 def dmenu_cmd(num_lines, prompt):
@@ -343,7 +289,7 @@ def get_entries(dbo):
     if dbf is None:
         return None
     try:
-        kpo = PyKeePass(dbf, password, keyfile=keyfile)
+        kpo = PyKeePass(dbf, password, keyfile=keyfile, timeout=60)
     except (FileNotFoundError, construct.core.ChecksumError) as err:
         if str(err.args[0]).startswith("wrong checksum"):
             dmenu_err("Invalid Password or keyfile")
@@ -1195,205 +1141,88 @@ def view_notes(notes):
     return sel
 
 
-def client():
-    """Define client connection to server BaseManager
+def dmenu_run():  # pylint: disable=too-many-branches,too-many-return-statements
+    """Run dmenu with the given list of Keepass Entry objects
 
-    Returns: BaseManager object
+    If 'hide_groups' is defined in config.ini, hide those from main and
+    view/type all views.
+
+    Args: kpo - Keepass object
+
     """
-    port, auth = get_auth()
-    mgr = BaseManager(address=('', port), authkey=auth)
-    mgr.register('set_event')
-    mgr.connect()
-    return mgr
-
-
-class DmenuRunner(Process):
-    """Listen for dmenu calling event and run keepmenu
-
-    Args: server - Server object
-          kpo - Keepass object
-    """
-    def __init__(self, server):
-        Process.__init__(self)
-        self.server = server
-        self.database = get_database()
-        self.kpo = get_entries(self.database)
-        if not self.kpo:
-            self.server.kill_flag.set()
-            sys.exit()
-
-    def _set_timer(self):
-        """Set inactivity timer
-
-        """
-        self.cache_timer = Timer(CACHE_PERIOD_MIN * 60, self.cache_time)
-        self.cache_timer.daemon = True
-        self.cache_timer.start()
-
-    def run(self):
-        while True:
-            self.server.start_flag.wait()
-            if self.server.kill_flag.is_set():
-                break
-            if not self.kpo:
-                pass
-            else:
-                self.dmenu_run()
-            if self.server.cache_time_expired.is_set():
-                self.server.kill_flag.set()
-            if self.server.kill_flag.is_set():
-                break
-            self.server.start_flag.clear()
-
-    def cache_time(self):
-        """Kill keepmenu daemon when cache timer expires
-
-        """
-        self.server.cache_time_expired.set()
-        if not self.server.start_flag.is_set():
-            self.server.kill_flag.set()
-            self.server.start_flag.set()
-
-    def dmenu_run(self):  # pylint: disable=too-many-branches,too-many-return-statements
-        """Run dmenu with the given list of Keepass Entry objects
-
-        If 'hide_groups' is defined in config.ini, hide those from main and
-        view/type all views.
-
-        Args: self.kpo - Keepass object
-
-        Note: I had to reload the kpo object after every save to prevent being
-        affected by the gibberish password bug in pykeepass:
-        https://github.com/pschmitt/pykeepass/issues/43
-
-        Once this is fixed, the extra calls to self.kpo = get_entries... can be
-        deleted
-
-        """
-        try:
-            self.cache_timer.cancel()
-        except AttributeError:
-            pass
-        self._set_timer()
-        options = ['View/Type Individual entries',
-                   'Edit entries',
-                   'Add entry',
-                   'Manage groups',
-                   'Reload database',
-                   'Kill Keepmenu daemon']
-        if CONF.has_option("database", "hide_groups"):
-            hid_groups = CONF.get("database", "hide_groups").split("\n")
-            # Validate ignored group names in config.ini
-            hid_groups = [i for i in hid_groups if i in
-                          [j.name for j in self.kpo.groups]]
-        else:
-            hid_groups = []
-        sel = view_all_entries(options, [i for i in self.kpo.entries if not
+    database = get_database()
+    kpo = get_entries(database)
+    options = ['View/Type Individual entries',
+               'Edit entries',
+               'Add entry',
+               'Manage groups',
+               'Reload database',
+               'Kill Keepmenu daemon']
+    if CONF.has_option("database", "hide_groups"):
+        hid_groups = CONF.get("database", "hide_groups").split("\n")
+        # Validate ignored group names in config.ini
+        hid_groups = [i for i in hid_groups if i in
+                      [j.name for j in kpo.groups]]
+    else:
+        hid_groups = []
+    sel = view_all_entries(options, [i for i in kpo.entries if not
+                                     any(j in i.path.rstrip(i.title) for
+                                         j in hid_groups)])
+    if not sel:
+        return
+    if sel == options[0]:  # ViewType Individual entries
+        options = []
+        sel = view_all_entries(options, [i for i in kpo.entries if not
                                          any(j in i.path.rstrip(i.title) for
                                              j in hid_groups)])
-        if not sel:
+        try:
+            entry = kpo.entries[int(sel.split('-', 1)[0])]
+        except (ValueError, TypeError):
             return
-        if sel == options[0]:  # ViewType Individual entries
-            options = []
-            sel = view_all_entries(options, [i for i in self.kpo.entries if not
-                                             any(j in i.path.rstrip(i.title) for
-                                                 j in hid_groups)])
-            try:
-                entry = self.kpo.entries[int(sel.split('-', 1)[0])]
-            except (ValueError, TypeError):
-                return
-            text = view_entry(entry)
-            type_text(text)
-        elif sel == options[1]:  # Edit entries
-            options = []
-            sel = view_all_entries(options, self.kpo.entries)
-            try:
-                entry = self.kpo.entries[int(sel.split('-', 1)[0])]
-            except (ValueError, TypeError):
-                return
-            edit = True
-            while edit is True:
-                edit = edit_entry(self.kpo, entry)
-            self.kpo.save()
-            self.kpo = get_entries(self.database)
-        elif sel == options[2]:  # Add entry
-            entry = add_entry(self.kpo)
-            if entry:
-                self.kpo.save()
-                self.kpo = get_entries(self.database)
-        elif sel == options[3]:  # Manage groups
-            group = manage_groups(self.kpo)
-            if group:
-                self.kpo.save()
-                self.kpo = get_entries(self.database)
-        elif sel == options[4]:  # Reload database
-            self.kpo = get_entries(self.database)
-            if not self.kpo:
-                return
-            self.dmenu_run()
-        elif sel == options[5]:  # Kill keepmenu daemon
-            try:
-                self.server.kill_flag.set()
-            except (EOFError, IOError):
-                return
-        else:
-            try:
-                entry = self.kpo.entries[int(sel.split('-', 1)[0])]
-            except (ValueError, TypeError):
-                return
-            type_entry(entry)
-
-
-class Server(Process):
-    """Run BaseManager server to listen for dmenu calling events
-
-    """
-    def __init__(self):
-        Process.__init__(self)
-        self.port, self.authkey = get_auth()
-        self.start_flag = Event()
-        self.kill_flag = Event()
-        self.cache_time_expired = Event()
-        self.start_flag.set()
-
-    def run(self):
-        serv = self.server()  # pylint: disable=unused-variable
-        self.kill_flag.wait()
-
-    def server(self):
-        """Set up BaseManager server
-
-        """
-        mgr = BaseManager(address=('127.0.0.1', self.port),
-                          authkey=self.authkey)
-        mgr.register('set_event', callable=self.start_flag.set)
-        mgr.start()
-        return mgr
-
-
-def run():
-    """Main entrypoint. Start the background Manager and Dmenu runner processes.
-
-    """
-    server = Server()
-    dmenu = DmenuRunner(server)
-    dmenu.daemon = True
-    server.start()
-    dmenu.start()
-    server.join()
-    if exists(expanduser(AUTH_FILE)):
-        os.remove(expanduser(AUTH_FILE))
+        text = view_entry(entry)
+        type_text(text)
+    elif sel == options[1]:  # Edit entries
+        options = []
+        sel = view_all_entries(options, kpo.entries)
+        try:
+            entry = kpo.entries[int(sel.split('-', 1)[0])]
+        except (ValueError, TypeError):
+            return
+        edit = True
+        while edit is True:
+            edit = edit_entry(kpo, entry)
+        kpo.save()
+    elif sel == options[2]:  # Add entry
+        entry = add_entry(kpo)
+        if entry:
+            kpo.save()
+    elif sel == options[3]:  # Manage groups
+        group = manage_groups(kpo)
+        if group:
+            kpo.save()
+    elif sel == options[4]:  # Reload database
+        kpo = get_entries(database)
+        if not kpo:
+            return
+        dmenu_run()
+    elif sel == options[5]:  # Kill keepmenu server
+        try:
+            server.kill_flag.set()
+        except (EOFError, IOError):
+            return
+    else:
+        try:
+            entry = kpo.entries[int(sel.split('-', 1)[0])]
+        except (ValueError, TypeError):
+            return
+        type_entry(entry)
 
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         print("See `man keepmenu` for help")
         sys.exit()
-    try:
-        MANAGER = client()
-        MANAGER.set_event()  # pylint: disable=no-member
-    except socket.error:  ## Use socket.error for Python 2 & 3 compat.
-        process_config()
-        run()
+    process_config()
+    dmenu_run()
 
 # vim: set et ts=4 sw=4 :
