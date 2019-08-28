@@ -3,7 +3,6 @@
 """Read and copy Keepass database entries using dmenu or rofi
 
 """
-from contextlib import closing
 import errno
 import itertools
 import locale
@@ -11,19 +10,17 @@ import os
 from os.path import exists, expanduser
 import random
 import shlex
-import socket
 import string
 import sys
 from subprocess import call, Popen, PIPE
 import tempfile
-from threading import Timer
 import time
 import re
 import webbrowser
 import construct
 from pykeyboard import PyKeyboard
 from pymouse.x11 import X11Error
-from pykeepass_cache import PyKeePass
+from pykeepass_cache import PyKeePass, cached_databases
 
 try:
     import configparser
@@ -289,7 +286,7 @@ def get_entries(dbo):
     if dbf is None:
         return None
     try:
-        kpo = PyKeePass(dbf, password, keyfile=keyfile, timeout=60)
+        kpo = PyKeePass(dbf, password, keyfile=keyfile, timeout=300)
     except (FileNotFoundError, construct.core.ChecksumError) as err:
         if str(err.args[0]).startswith("wrong checksum"):
             dmenu_err("Invalid Password or keyfile")
@@ -1141,17 +1138,16 @@ def view_notes(notes):
     return sel
 
 
-def dmenu_run():  # pylint: disable=too-many-branches,too-many-return-statements
+def dmenu_run(database, kpo):  # pylint: disable=too-many-branches,too-many-return-statements
     """Run dmenu with the given list of Keepass Entry objects
 
     If 'hide_groups' is defined in config.ini, hide those from main and
     view/type all views.
 
-    Args: kpo - Keepass object
+    Args: database - current keepass database path (string)
+          kpo - pykeepass_cache object
 
     """
-    database = get_database()
-    kpo = get_entries(database)
     options = ['View/Type Individual entries',
                'Edit entries',
                'Add entry',
@@ -1201,13 +1197,15 @@ def dmenu_run():  # pylint: disable=too-many-branches,too-many-return-statements
         if group:
             kpo.save()
     elif sel == options[4]:  # Reload database
-        kpo = get_entries(database)
+        # kpo = get_entries(database)
+        # TODO - reloading database
         if not kpo:
             return
-        dmenu_run()
+        # dmenu_run()
     elif sel == options[5]:  # Kill keepmenu server
         try:
-            server.kill_flag.set()
+            # TODO How to kill server?
+            pass
         except (EOFError, IOError):
             return
     else:
@@ -1217,12 +1215,24 @@ def dmenu_run():  # pylint: disable=too-many-branches,too-many-return-statements
             return
         type_entry(entry)
 
+def main():
+    """Script entrypoint
+
+    """
+    process_config()
+    try:
+        # TODO Assume for now only one database open at a time
+        dmenu_run(*[[i, j] for i, j in cached_databases().items()][0])
+    except IndexError:
+        dbase = get_database()
+        kpo = get_entries(dbase)
+        dmenu_run(dbase, kpo)
+
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         print("See `man keepmenu` for help")
         sys.exit()
-    process_config()
-    dmenu_run()
+    main()
 
 # vim: set et ts=4 sw=4 :
