@@ -1223,10 +1223,12 @@ def main():
     try:
         # TODO Assume for now only one database open at a time
         dmenu_run(*[[i, j] for i, j in cached_databases().items()][0])
+        del kpo
     except IndexError:
         dbase = get_database()
         kpo = get_entries(dbase)
         dmenu_run(dbase, kpo)
+        del kpo
 
 
 if __name__ == '__main__':
